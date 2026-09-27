@@ -19,9 +19,16 @@
     </div>
 
     <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      <label class="filter-item">
+        <span>标定编号</span>
+        <input v-model="keyword" placeholder="按标定编号检索" />
+      </label>
+      <label class="filter-item">
+        <span>标定状态</span>
+        <select v-model="statusFilter">
+          <option value="">全部状态</option>
+          <option v-for="status in statuses" :key="status" :value="status">{{ status }}</option>
+        </select>
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -57,8 +64,26 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条设备标定记录</span>
+      <span v-if="noticeMessage" class="notice-text">{{ noticeMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <div v-if="createVisible" class="dialog-mask" @click.self="createVisible = false">
+      <div class="dialog">
+        <h3>登记标定记录</h3>
+        <form class="dialog-form" @submit.prevent="submitCreate">
+          <label v-for="field in createFields" :key="field.name">
+            <span>{{ field.name }}{{ field.required ? '（必填）' : '' }}</span>
+            <input v-model="createForm[field.name]" :placeholder="`请填写${field.name}`" />
+          </label>
+          <p v-if="createError" class="error-text">{{ createError }}</p>
+          <div class="dialog-actions">
+            <button class="btn ghost" type="button" @click="createVisible = false">取消</button>
+            <button class="btn primary" type="submit">提交登记</button>
+          </div>
+        </form>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -68,21 +93,34 @@ import { onMounted, ref } from 'vue'
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
+type StatItem = { label: string; value: number }
 
 const ENDPOINT = '/api/calibration'
 const columns = ["标定编号", "标定对象", "标定机构", "标定项目", "标定结论", "有效期至", "标定人员", "标定状态"]
 const actions = ["送检登记", "确认合格", "判定不合格"]
 const statuses = ["待送检", "标定中", "标定合格", "标定不合格"]
-const stats = [{"label": "待送检设备", "value": 0}, {"label": "本月合格数", "value": 0}, {"label": "超期未标定", "value": 0}]
+const createFields = [
+  { name: '标定编号', required: true },
+  { name: '标定对象', required: true },
+  { name: '标定机构', required: true },
+  { name: '标定项目', required: false },
+  { name: '标定人员', required: false },
+]
 
 const rows = ref<Row[]>([])
 const total = ref(0)
+const stats = ref<StatItem[]>([])
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const noticeMessage = ref('')
+const keyword = ref('')
+const statusFilter = ref('')
+const createVisible = ref(false)
+const createError = ref('')
+const createForm = ref<Record<string, string>>({})
 
 function resetFilters() {
-  filters.value = {}
+  keyword.value = ''
+  statusFilter.value = ''
   void reload()
 }
 
@@ -91,20 +129,65 @@ function exportRows() {
 }
 
 function openCreate() {
-  errorMessage.value = '标定记录登记入口尚未接入审批流'
+  createForm.value = {}
+  createError.value = ''
+  createVisible.value = true
+}
+
+async function readPayload(response: Response): Promise<Record<string, unknown>> {
+  try {
+    return (await response.json()) as Record<string, unknown>
+  } catch {
+    return {}
+  }
+}
+
+async function backendMessage(response: Response, fallback: string): Promise<string> {
+  const payload = await readPayload(response)
+  if (typeof payload.message === 'string' && payload.message) return payload.message
+  if (typeof payload.detail === 'string' && payload.detail) return payload.detail
+  return response.ok ? fallback : `${fallback}（接口返回 ${response.status}）`
+}
+
+async function submitCreate() {
+  createError.value = ''
+  try {
+    const response = await request(ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify({ values: createForm.value }),
+    })
+    const payload = await readPayload(response)
+    if (!response.ok || payload.ok === false) {
+      createError.value = typeof payload.message === 'string' && payload.message
+        ? payload.message
+        : `标定记录登记未生效（接口返回 ${response.status}）`
+      return
+    }
+    createVisible.value = false
+    noticeMessage.value = typeof payload.message === 'string' ? payload.message : '标定记录已登记'
+    await Promise.all([reload(), loadStats()])
+  } catch (error) {
+    createError.value = error instanceof Error ? error.message : '标定记录登记失败'
+  }
 }
 
 async function runAction(action: string, row: Row) {
   errorMessage.value = ''
+  noticeMessage.value = ''
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ values: { action } }),
     })
-    if (!response.ok) {
-      throw new Error('设备标定动作未生效，请稍后重试')
+    const payload = await readPayload(response)
+    if (!response.ok || payload.ok === false) {
+      errorMessage.value = typeof payload.message === 'string' && payload.message
+        ? payload.message
+        : `设备标定动作未生效（接口返回 ${response.status}）`
+      return
     }
-    await reload()
+    noticeMessage.value = typeof payload.message === 'string' ? payload.message : `标定记录已${action}`
+    await Promise.all([reload(), loadStats()])
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '设备标定操作失败'
   }
@@ -112,11 +195,13 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = new URLSearchParams()
+  if (keyword.value.trim()) query.set('keyword', keyword.value.trim())
+  if (statusFilter.value) query.set('status', statusFilter.value)
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}?${query.toString()}`)
     if (!response.ok) {
-      throw new Error('标定记录列表读取失败')
+      throw new Error(await backendMessage(response, '标定记录列表读取失败'))
     }
     const payload = await response.json()
     rows.value = payload.items ?? []
@@ -126,5 +211,19 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+async function loadStats() {
+  try {
+    const response = await request(`${ENDPOINT}/stats`)
+    if (!response.ok) return
+    const payload = await response.json()
+    stats.value = payload.items ?? []
+  } catch {
+    // 统计卡片加载失败不阻断列表操作
+  }
+}
+
+onMounted(() => {
+  void reload()
+  void loadStats()
+})
 </script>
